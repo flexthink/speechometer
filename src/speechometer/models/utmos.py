@@ -21,7 +21,7 @@ class UTMOSModel(nn.Module):
     ---------
     source : str
         The WavLM source
-    save_path : str | path-like
+    save_path : str | PathLike
         The path where the model will be saved
     features_dim : int, optional
         The features dimension
@@ -92,7 +92,7 @@ class UTMOSModel(nn.Module):
         wav: torch.Tensor,
         domain_id: torch.Tensor | None = None,
         judge_id: torch.Tensor | None = None
-    ):
+    ) -> torch.Tensor:
         """Computes the forward pass
 
         Arguments

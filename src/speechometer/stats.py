@@ -68,5 +68,6 @@ def descriptive_statistics(
         "iqr": q3 - q1,
     }
     return {
-        f"{result_key}_{stat_key}": value.item() for stat_key, value in stats.items()
+        f"{result_key}_{stat_key}": value.item()
+        for stat_key, value in stats.items()
     }

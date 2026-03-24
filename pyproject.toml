@@ -1,0 +1,16 @@
+[project]
+name = "speechometer"
+version = "0.0.1"
+dependencies = [
+    "speechbrain @ git+https://github.com/flexthink/speechbrain.git@paintbrush-fix",
+]
+
+[tool.black]
+line-length = 80
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["speechometer*"]

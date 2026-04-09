@@ -439,7 +439,7 @@ class ASRStats(SpeechMetricStats):
     """
     def __init__(
         self,
-        transcriber: Transcriber | Callable | None,
+        transcriber: Transcriber | Callable | None = None,
         save_path: str | PathLike | None = None,
         run_opts: dict | None = None
     ):

@@ -276,6 +276,32 @@ class Transcriber(ABC):
 
 
 class WhisperTranscriber(Transcriber):
+    """A Transcriber implementation for Whisper
+    
+    Attributes
+    ----------
+    source : str | None
+        The source (path or HuggingFace hub) of the
+        Whisper model to use
+    model : torch.nn.Module | Non
+        A pre-loaded Whisper model. Useful for situations
+        where a single training recipe uses Whisper for
+        more than only the metric or for multiple metrics
+    sample_rate : int
+        The sample rate of the Whisper model
+    min_decode_ratio : float
+        The minimum decode ratio
+    max_decode_ratio : float
+        The maximum decode ratio
+    unbatch : bool
+        Whether to "undo" batches and process
+        one example at a time. This has been known to
+        improve performance
+    run_opts : dict | None
+        Runtime options
+
+        "device": the device identifier
+    """
     def __init__(
         self,
         source: str | None = None,

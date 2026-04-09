@@ -8,13 +8,14 @@ Authors
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 import csv
 import json
 from os import PathLike
 import re
 import string
 from pathlib import Path
-from typing import TextIO
+from typing import TextIO, Any
 
 import torch
 import torchaudio
@@ -27,10 +28,12 @@ from speechbrain.utils.fetching import fetch
 from speechbrain.utils.importutils import LazyModule
 from speechbrain.utils.logger import get_logger
 from speechbrain.utils.metric_stats import ErrorRateStats, MetricStats
+from speechbrain.integrations.nlp.bleu import BLEUStats
 from speechometer.models.utmos import UTMOSModel
 from transformers import AutoModelForAudioXVector
 
 from speechometer.stats import descriptive_statistics
+from speechometer.utils import undo_padding
 
 logger = get_logger(__name__)
 
@@ -130,7 +133,7 @@ class SpeechMetricStats(MetricStats, ABC):
         """
         pass
 
-    def summarize(self, field: str | None = None) -> any:
+    def summarize(self, field: str | None = None) -> Any:
         """Computes the summary if not already computed and returns
         either the entire summary or one of the available fields
 
@@ -141,7 +144,7 @@ class SpeechMetricStats(MetricStats, ABC):
 
         Returns
         -------
-        result : any
+        result : Any
             a dictionary with computed statistics if no field is provided
             or a specific value from that dictionary if one is provided
         """
@@ -178,7 +181,7 @@ class SingleMetricStats(SpeechMetricStats):
     def __init__(self):
         self.clear()
         self.report_key = type(self).__name__.replace(
-            "MetricStats", ""
+            "Stats", ""
         ).lower()
 
     def append_scores(
@@ -241,22 +244,216 @@ class SingleMetricStats(SpeechMetricStats):
             self.write_report(report_file)
 
 
-class ASRMetricStats(SpeechMetricStats):
+class Transcriber(ABC):
+    """An ASR transcriber wrapper"""
+    @abstractmethod
+    def transcribe(
+        self,
+        wavs: torch.Tensor,
+        length: torch.Tensor,
+        sample_rate: int,
+        language: str = None
+    ) -> list:
+        """Makes an ASR prediction
+
+        Arguments
+        ---------
+        wavs : torch.Tensor
+            Raw waveforms
+        length : torch.Tensor
+            Relative lengths
+        sample_rate : int
+            The sample rate of the waveform
+        language : str
+            The language identifier
+
+        Returns
+        -------
+        predictions : list
+            The text predictions
+        """
+        pass
+
+
+class WhisperTranscriber(Transcriber):
+    def __init__(
+        self,
+        source: str | None = None,
+        model: torch.nn.Module | None = None,
+        save_path: str | PathLike | None = None,
+        sample_rate: int = 22050,
+        min_decode_ratio: float = 0.0,
+        max_decode_ratio: float = 1.0,
+        unbatch: bool = True,
+        run_opts: dict | None = None,
+    ):
+        if source is None:
+            source = ASR_WHISPER_DEFAULT_SOURCE
+        if run_opts is None:
+            run_opts = {}
+        if save_path is None:
+            save_path = "."
+        if model is not None:
+            self.model = model
+        else:
+            self.model = Whisper(
+                source,
+                save_path,
+                sample_rate,
+                freeze=True,
+                freeze_encoder=True,
+            )
+        self.sample_rate = sample_rate
+        self.model.tokenizer.set_prefix_tokens("english", "transcribe", False)
+        self.searcher = S2SWhisperGreedySearcher(
+            self.model,
+            min_decode_ratio=min_decode_ratio,
+            max_decode_ratio=max_decode_ratio,
+        )
+        device = run_opts.get("device", next(self.model.parameters()).device)
+        self.unbatch = unbatch
+        self.to(device)
+
+    def transcribe(
+        self,
+        wavs: torch.Tensor,
+        length: torch.Tensor,
+        sample_rate: int,
+        language: str = None
+    ) -> list:
+        """Makes an ASR prediction
+
+        Arguments
+        ---------
+        wavs : torch.Tensor
+            Raw waveforms
+        length : torch.Tensor
+            Relative lengths
+        sample_rate : int
+            The sample rate of the waveform
+        language : str
+            The language identifier
+
+        Returns
+        -------
+        predictions : list
+            The text predictions
+        """
+        if self.unbatch:
+            full_length = torch.ones(1, device=wavs.device)
+            wavs = undo_padding(
+                wavs, length
+            )
+            result = [
+                self._transcribe(
+                    wavs=wavs_item.unsqueeze(0),
+                    length=full_length,
+                    sample_rate=sample_rate,
+                    language=language
+                )[0]
+                for wavs_item in wavs
+            ]
+        else:
+            result = self._transcribe(
+                wavs=wavs,
+                length=length,
+                sample_rate=sample_rate,
+                language=language
+            )
+        return result
+
+    def _transcribe(
+        self,
+        wavs: torch.Tensor,
+        length: torch.Tensor,
+        sample_rate: int,
+        language: str = None
+    ) -> list:
+        """Makes an ASR prediction
+
+        Arguments
+        ---------
+        wavs : torch.Tensor
+            Raw waveforms
+        length : torch.Tensor
+            Relative lengths
+        sample_rate : int
+            The sample rate of the waveform
+        language : str
+            The language identifier
+
+        Returns
+        -------
+        predictions : list
+            The text predictions
+        """
+        if sample_rate is None:
+            sample_rate = self.sample_rate
+        if language is not None:
+            self.model.tokenizer.set_prefix_tokens(
+                language=language, task="transcribe", predict_timestamps=False
+            )
+            self.searcher.set_task("transcribe")
+        wavs = torchaudio.functional.resample(
+            wavs, sample_rate, self.sample_rate
+        )
+        wavs = self.model.pad_or_trim(wavs)
+        mels = self.model.log_mel_spectrogram(wavs)
+        enc_out = self.model.forward_encoder(mels)
+        predictions, _, _, _ = self.searcher(enc_out.detach(), length)
+        predictions = self.model.tokenizer.batch_decode(
+            predictions, skip_special_tokens=True
+        )
+        predictions = [normalize(text) for text in predictions]
+        return predictions
+
+    def to(self, device: str | torch.device) -> "Transcriber":
+        """Transfers this module to the spcieifed device
+
+        Arguments
+        ---------
+        device : str | torch.device
+            the target device
+
+        Returns
+        -------
+        result : Transcriber
+            The evaluator, on the correct device
+        """
+        self.model = self.model.to(device)
+        return self
+
+
+class ASRStats(SpeechMetricStats):
     """A base class for ASR-based evaluators
 
     Arguments
     ---------
-    unbatch : bool
-        Whether to undo batches
+    transcriber : Transcriber | Callable | None
+        The ASR wrapper to use
+    save_path: str | PathLike | None
+        The path to save the transcriber model
+        (if the default model is used)
+    run_opts : dict | None
+        Run options for the transcriber
     """
-
     def __init__(
         self,
-        unbatch: bool = False,
+        transcriber: Transcriber | Callable | None,
+        save_path: str | PathLike | None = None,
+        run_opts: dict | None = None
     ):
         self.ids = []
         self.metrics = self._init_metrics()
-        self.unbatch = unbatch
+        if transcriber is None:
+            self.transcriber = WhisperTranscriber(
+                save_path=save_path,
+                run_opts=run_opts
+            )
+        elif isinstance(transcriber, Transcriber):
+            self.transcriber = transcriber
+        else:
+            self.transcriber = transcriber(run_opts=run_opts)
         self.clear()
 
     def _init_metrics(self):
@@ -313,77 +510,15 @@ class ASRMetricStats(SpeechMetricStats):
         self.ids.extend(ids)
         if sample_rate_ref is None:
             sample_rate_ref = sample_rate
-        if self.unbatch:
-            batch_size = len(wavs)
-            length_abs = (length * wavs.size(1)).int()
-            length_ref_abs = (length_ref * wavs.size(1)).int()
-            for idx in range(batch_size):
-                self._evaluate_samples(
-                    ids[idx: idx + 1],
-                    wavs=wavs[idx:idx + 1, : length_abs[idx].item()],
-                    length=torch.ones(1, device=wavs.device),
-                    text=text[idx:idx + 1],
-                    wavs_ref=wavs_ref[
-                        idx:idx + 1, : length_ref_abs[idx].item()
-                    ],
-                    length_ref=torch.ones(1, device=wavs_ref.device),
-                    sample_rate=sample_rate,
-                    sample_rate_ref=sample_rate_ref,
-                    language=language,
-                )
-        else:
-            self._evaluate_samples(
-                wavs,
-                length,
-                text,
-                wavs_ref,
-                length_ref,
-                sample_rate,
-                sample_rate_ref,
-                language=language,
-            )
-
-    def _evaluate_samples(
-        self,
-        ids: list,
-        wavs: torch.Tensor,
-        length: torch.Tensor,
-        text: list | None,
-        wavs_ref: torch.Tensor | None,
-        length_ref: torch.Tensor | None,
-        sample_rate: int | None = None,
-        sample_rate_ref: int | None = None,
-        language: str | None = None
-    ):
-        """Evaluates a batch of samples. This function is meant
-        to be used internally. evaluate_samples will call
-        it multiple times if unbatch is enabled.
-
-        Arguments
-        ---------
-        ids : list
-            The utterance IDs
-        wavs : torch.Tensor
-            A batch of waveforms
-        length : torch.Tensor
-            Relative lengths
-        text : list | None
-            Text labels corresponding to the waveforms
-        wavs_ref : torch.Tensor | None
-            A batch of waveforms (ground truth)
-        length_ref : torch.Tensor | None
-            Relative lengths (ground truth)
-        sample_rate : int | None
-            The sample rate of the waveforms
-        sample_rate_ref : int | None
-            The sample rate of the reference waveforms
-        language: str | None
-            The language identifier, if applicable
-        """
-        predictions = self.predict(wavs, length, sample_rate, language)
+        predictions = self.transcriber.transcribe(
+            wavs=wavs,
+            length=length,
+            sample_rate=sample_rate,
+            language=language
+        )
         predictions_words = self._split_words(predictions)
         text_words = self._split_words(text)
-        predictions_ref = self.predict(
+        predictions_ref = self.transcriber.transcribe(
             wavs_ref,
             length_ref,
             sample_rate_ref,
@@ -417,7 +552,21 @@ class ASRMetricStats(SpeechMetricStats):
     def _split_words(self, items: str) -> list:
         return [utt_seq.split(" ") for utt_seq in items]
 
-    def summarize(self, field: str = None) -> dict:
+    def summarize(self, field: str | None = None) -> Any:
+        """Computes the summary if not already computed and returns
+        either the entire summary or one of the available fields
+
+        Arguments
+        ---------
+        field : str | None
+            The name of the field to be retreived
+
+        Returns
+        -------
+        result : Any
+            a dictionary with computed statistics if no field is provided
+            or a specific value from that dictionary if one is provided
+        """
         summary = self._summarize()
         return summary.get(field) if field is not None else summary
 
@@ -437,26 +586,7 @@ class ASRMetricStats(SpeechMetricStats):
         summary.update(micro_stats)
         return summary
 
-    def normalize(self, text: str) -> str:
-        """Performs text normalization (uppercase, remove whitespace,
-        remove punctuation)
-
-        Arguments
-        ---------
-        text : str
-            Unnormalized text
-
-        Returns
-        -------
-        text : str
-            Normalized text
-        """
-        text = text.upper()
-        text = text.strip()
-        text = RE_PUNCTUATION.sub("", text)
-        return text
-
-    def to(self, device: str | torch.device) -> "ASRMetricStats":
+    def to(self, device: str | torch.device) -> "ASRStats":
         """Transfers this module to the spcieifed device
 
         Arguments
@@ -466,7 +596,7 @@ class ASRMetricStats(SpeechMetricStats):
 
         Returns
         -------
-        result : ASRMetricStats
+        result : ASRStats
             The evaluator, on the correct device
         """
         self.model = self.model.to(device)
@@ -516,119 +646,7 @@ class ASRMetricStats(SpeechMetricStats):
     stats_keys = ASR_METRICS
 
 
-class WhisperASR(ASRMetricStats):
-    """A speech evaluator implementation based on Whisper ASR
-
-    Arguments
-    ---------
-    source : str | None
-        The source directory
-    model: torch.nn.Module | None
-        a pretrained Whisper model
-    save_path : str | PathLike | None
-        The path where Whisper will be saved
-    sample_rate: int
-        The audio sample rate
-    min_decode_ratio : float, optional
-        The minimum decode ratio
-    max_decode_ratio : float, optional
-        The maximum decode ratio
-    run_opts : dict | None
-        Run options for the Whisper model
-    unbatch : bool, optional
-        If enabled, which is the default, the implementation
-        will evaluate samples one by one with a batch size of
-        1 and then "reassemble" the original batch. This is
-        sometimes needed because batched inference has been
-        found to result in decreased performance, primarily
-        due to masks not being applied to convolutional layers
-    """
-
-    def __init__(
-        self,
-        source: str | None = None,
-        model: torch.nn.Module | None = None,
-        save_path: str | PathLike | None = None,
-        sample_rate: int = 22050,
-        min_decode_ratio: float = 0.0,
-        max_decode_ratio: float = 1.0,
-        run_opts: dict | None = None,
-        unbatch: bool = True,
-    ):
-        super().__init__(unbatch=unbatch)
-        if source is None:
-            source = ASR_WHISPER_DEFAULT_SOURCE
-        if run_opts is None:
-            run_opts = {}
-        if save_path is None:
-            save_path = "."
-        if model is not None:
-            self.model = model
-        else:
-            self.model = Whisper(
-                source,
-                save_path,
-                sample_rate,
-                freeze=True,
-                freeze_encoder=True,
-            )
-        self.sample_rate = sample_rate
-        self.model.tokenizer.set_prefix_tokens("english", "transcribe", False)
-        self.searcher = S2SWhisperGreedySearcher(
-            self.model,
-            min_decode_ratio=min_decode_ratio,
-            max_decode_ratio=max_decode_ratio,
-        )
-        device = run_opts.get("device", next(self.model.parameters()).device)
-        self.to(device)
-
-    def predict(
-        self,
-        wavs: torch.Tensor,
-        length: torch.Tensor,
-        sample_rate: int,
-        language: str = None
-    ) -> list:
-        """Makes an ASR prediction
-
-        Arguments
-        ---------
-        wavs : torch.Tensor
-            Waveforms
-        length : torch.Tensor
-            Negative lengths
-        sample_rate : int
-            The sample rate of the waveform
-        language : str
-            The language identifier (Whisper-compatible)
-
-        Returns
-        -------
-        predictions : list
-            The text predictions
-        """
-        if sample_rate is None:
-            sample_rate = self.sample_rate
-        if language is not None:
-            self.model.tokenizer.set_prefix_tokens(
-                language=language, task="transcribe", predict_timestamps=False
-            )
-            self.searcher.set_task("transcribe")
-        wavs = torchaudio.functional.resample(
-            wavs, sample_rate, self.sample_rate
-        )
-        wavs = self.model.pad_or_trim(wavs)
-        mels = self.model.log_mel_spectrogram(wavs)
-        enc_out = self.model.forward_encoder(mels)
-        predictions, _, _, _ = self.searcher(enc_out.detach(), length)
-        predictions = self.model.tokenizer.batch_decode(
-            predictions, skip_special_tokens=True
-        )
-        predictions = [self.normalize(text) for text in predictions]
-        return predictions
-
-
-class UTMOS(SingleMetricStats):
+class UTMOSStats(SingleMetricStats):
     """A metric implementing UTMOS
 
     Arguments
@@ -781,7 +799,7 @@ class UTMOS(SingleMetricStats):
         self.append_scores(ids, output)
 
 
-class NISQA(SingleMetricStats):
+class NISQAStats(SingleMetricStats):
     """A wrapper for the NISQA metric
 
     Arguments
@@ -885,7 +903,7 @@ class NISQA(SingleMetricStats):
         self.append_scores(ids, scores)
 
 
-class SpkSimECAPATDNN(SingleMetricStats):
+class SpkSimECAPATDNNStats(SingleMetricStats):
     """Speaker Similarity using ECAPA-TDNN
 
     Arguments
@@ -957,6 +975,7 @@ class SpkSimECAPATDNN(SingleMetricStats):
         """
         assert wavs.shape == wavs_ref.shape
         assert wavs.ndim == 2
+        assert wavs_ref is not None
 
         if sample_rate is None:
             sample_rate = self.sample_rate
@@ -980,7 +999,7 @@ class SpkSimECAPATDNN(SingleMetricStats):
         audio = torch.cat([wavs, wavs_ref])
         if length is not None:
             length = torch.cat([length, length])
-
+        assert self.model is not None
         self.model.device = wavs.device
         self.model.to(wavs.device)
         self.model.eval()
@@ -989,10 +1008,10 @@ class SpkSimECAPATDNN(SingleMetricStats):
         embs = self.model.encode_batch(audio, length, normalize=False)
         hyp_embs, ref_embs = embs.split([len(wavs), len(wavs_ref)])
         scores = self.model.similarity(hyp_embs, ref_embs)[:, 0]
-        self.append_scores(ids, scores, language=language)
+        self.append_scores(ids, scores)
 
 
-class SpkSimWavLM(SingleMetricStats):
+class SpkSimWavLMStats(SingleMetricStats):
     """Speaker Similarity using WavLM
 
     Arguments
@@ -1117,3 +1136,129 @@ class SpkSimWavLM(SingleMetricStats):
 
         self.ids += ids
         self.append_scores(ids, scores)
+
+
+class SpeechBLEUStats(SpeechMetricStats):
+    """Statistics for the BLEU metric
+
+    Arguments
+    ---------
+    transcriber: Transcriber | Callable | None
+        An ASR wrapper
+    save_path: str | PathLike | None
+        The path to save the transcriber model
+        (if the default model is used)
+    run_opts : dict | None
+        Run options for the transcriber
+    """
+    def __init__(
+        self,
+        transcriber: Transcriber | Callable | None = None,
+        save_path: str | PathLike | None = None,
+        run_opts: dict | None = None
+    ):
+        self.bleu = BLEUStats()
+        self.ids = []
+        if transcriber is None:
+            self.transcriber = WhisperTranscriber(
+                save_path=save_path,
+                run_opts=run_opts
+            )
+        elif isinstance(transcriber, Transcriber):
+            self.transcriber = transcriber
+        else:
+            self.transcriber = transcriber(run_opts=run_opts)
+        self.clear()
+
+    def append(
+        self,
+        ids: list,
+        wavs: torch.Tensor,
+        length: torch.Tensor,
+        text: list | None = None,
+        wavs_ref: torch.Tensor | None = None,
+        length_ref: torch.Tensor | None = None,
+        sample_rate: int | None = None,
+        sample_rate_ref: int | None = None,
+        language: str | None = None,
+    ):
+        """Evaluates a batch of samples
+
+        Arguments
+        ---------
+        ids : list
+            The utterance IDs
+        wavs : torch.Tensor
+            A batch of waveforms
+        length : torch.Tensor
+            Relative lengths
+        text : list | None
+            Text labels corresponding to the waveforms
+        wavs_ref : torch.Tensor | None
+            A batch of waveforms (ground truth)
+        length_ref : torch.Tensor | None
+            Relative lengths (ground truth)
+        sample_rate : int | None
+            The sample rate of the waveforms
+        sample_rate_ref : int | None
+            The sample rate of the reference waveforms
+        language : str | None
+            The language identifier, if applicable
+        """
+        self.ids.extend(ids)
+        text = self.transcriber.transcribe(
+            wavs=wavs,
+            length=length,
+            sample_rate=sample_rate,
+            language=language
+        )
+        text_ref = self.transcriber.transcribe(
+            wavs=wavs_ref,
+            length=length_ref,
+            sample_rate=sample_rate,
+            language=language
+        )
+        self.bleu.append(
+            ids=ids,
+            predict=text,
+            targets=[text_ref]
+        )
+
+    def summarize(self, field: str | None = None) -> Any:
+        """Computes the summary if not already computed and returns
+        either the entire summary or one of the available fields
+
+        Arguments
+        ---------
+        field : str | None
+            The name of the field to be retreived
+
+        Returns
+        -------
+        result : Any
+            a dictionary with computed statistics if no field is provided
+            or a specific value from that dictionary if one is provided
+        """
+        if not self.summary:
+            self.summary = self.bleu.summarize()
+        return self.summary
+
+
+def normalize(text: str) -> str:
+    """Performs text normalization (uppercase, remove whitespace,
+    remove punctuation)
+
+    Arguments
+    ---------
+    text : str
+        Unnormalized text
+
+    Returns
+    -------
+    text : str
+        Normalized text
+    """
+    text = text.upper()
+    text = text.strip()
+    text = RE_PUNCTUATION.sub("", text)
+    return text

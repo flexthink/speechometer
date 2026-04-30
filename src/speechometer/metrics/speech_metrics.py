@@ -28,7 +28,6 @@ from speechbrain.utils.fetching import fetch
 from speechbrain.utils.importutils import LazyModule
 from speechbrain.utils.logger import get_logger
 from speechbrain.utils.metric_stats import ErrorRateStats, MetricStats
-from speechbrain.integrations.nlp.bleu import BLEUStats
 from speechometer.models.utmos import UTMOSModel
 from transformers import AutoModelForAudioXVector
 
@@ -38,6 +37,7 @@ from speechometer.utils import undo_padding
 logger = get_logger(__name__)
 
 nisqa = LazyModule("nisqa", "torchmetrics.functional.audio.nisqa", None)
+bleu = LazyModule("bleu", "speechbrain.integrations.nlp.bleu", None)
 
 RE_PUNCTUATION = re.compile(
     "|".join(re.escape(char) for char in string.punctuation)
@@ -1183,7 +1183,7 @@ class SpeechBLEUStats(SpeechMetricStats):
         save_path: str | PathLike | None = None,
         run_opts: dict | None = None
     ):
-        self.bleu = BLEUStats()
+        self.bleu = bleu.BLEUStats()
         self.ids = []
         if transcriber is None:
             self.transcriber = WhisperTranscriber(

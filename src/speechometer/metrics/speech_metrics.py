@@ -576,7 +576,7 @@ class ASRStats(SpeechMetricStats):
             metric.append(ids, predictions_words, target_words)
 
     def _split_words(self, items: str) -> list:
-        return [utt_seq.split(" ") for utt_seq in items]
+        return [normalize(utt_seq).split(" ") for utt_seq in items]
 
     def summarize(self, field: str | None = None) -> Any:
         """Computes the summary if not already computed and returns

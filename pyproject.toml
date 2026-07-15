@@ -1,8 +1,16 @@
 [project]
 name = "speechometer"
 version = "0.0.1"
+license-files = ["LICENSE", "LICENSES/*.txt", "NOTICE"]
 dependencies = [
+    "librosa",
+    "numpy",
+    "onnxruntime",
     "speechbrain @ git+https://github.com/flexthink/speechbrain.git@paintbrush-fix",
+    "torch",
+    "torchaudio",
+    "torchmetrics[audio]",
+    "transformers",
 ]
 
 [tool.black]
@@ -14,3 +22,6 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["speechometer*"]
+
+[tool.setuptools.package-data]
+"speechometer.metrics" = ["*.onnx"]

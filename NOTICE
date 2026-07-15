@@ -1,0 +1,18 @@
+speechometer
+Copyright (c) 2026 flexthink
+
+This product includes software adapted from audiocodecs:
+https://github.com/lucadellalib/audiocodecs
+Source revision: 0c78632a803725c29cfac58cf26071cf4bc826d5
+
+Copyright 2025 Luca Della Libera.
+Licensed under the Apache License, Version 2.0. A copy of the license is
+provided in LICENSES/Apache-2.0.txt.
+
+Adapted components:
+- DNSMOS (including the bundled model_v8.onnx asset)
+- STOI
+- PESQ
+- Mel distance
+- STFT distance
+- ASR perplexity

@@ -1,7 +1,11 @@
-"""Reusable speech metric wrappers
+"""Reusable speech metric wrappers.
 
 Some metrics were adopted from the DASB benchmark
 https://github.com/speechbrain/benchmarks
+
+DNSMOS, STOI, PESQ, Mel distance, STFT distance, and ASR perplexity are
+adapted from the Apache-2.0-licensed ``lucadellalib/audiocodecs`` project:
+https://github.com/lucadellalib/audiocodecs
 
 Authors
  * Artem Ploujnikov 2026
@@ -11,12 +15,14 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 import csv
 import json
+import os
 from os import PathLike
 import re
 import string
 from pathlib import Path
 from typing import TextIO, Any
 
+import numpy as np
 import torch
 import torchaudio
 
@@ -29,7 +35,11 @@ from speechbrain.utils.importutils import LazyModule
 from speechbrain.utils.logger import get_logger
 from speechbrain.utils.metric_stats import ErrorRateStats, MetricStats
 from speechometer.models.utmos import UTMOSModel
-from transformers import AutoModelForAudioXVector
+from transformers import (
+    AutoModelForAudioXVector,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+)
 
 from speechometer.stats import descriptive_statistics
 from speechometer.utils import undo_padding
@@ -38,6 +48,10 @@ logger = get_logger(__name__)
 
 nisqa = LazyModule("nisqa", "torchmetrics.functional.audio.nisqa", None)
 bleu = LazyModule("bleu", "speechbrain.integrations.nlp.bleu", None)
+librosa = LazyModule("librosa", "librosa", None)
+onnxruntime = LazyModule("onnxruntime", "onnxruntime", None)
+pesq = LazyModule("pesq", "torchmetrics.functional.audio.pesq", None)
+stoi = LazyModule("stoi", "torchmetrics.functional.audio.stoi", None)
 
 RE_PUNCTUATION = re.compile(
     "|".join(re.escape(char) for char in string.punctuation)
@@ -70,6 +84,11 @@ UTMOS_DEFAULT_MODEL_NAME = "utmos.ckpt"
 UTMOS_DEFAULT_SAVE_DIR = "./pretrained_models"
 UTMOS_DEFAULT_JUDGE_ID = 288
 UTMOS_DEFAULT_DOMAIN_ID = 0
+
+AUDIOCODECS_METRIC_SAMPLE_RATE = 16000
+DNSMOS_INPUT_LENGTH = 9.01
+DNSMOS_DEFAULT_MODEL_PATH = Path(__file__).with_name("model_v8.onnx")
+ASR_PERPLEXITY_DEFAULT_MODEL_HUB = "meta-llama/Llama-3.2-1B"
 
 
 class SpeechMetricStats(MetricStats, ABC):
@@ -823,6 +842,495 @@ class UTMOSStats(SingleMetricStats):
         self.model.to(hyp_audio.device)
         output = self.model(hyp_audio)
         self.append_scores(ids, output)
+
+
+def _resample_audio(
+    wavs: torch.Tensor,
+    sample_rate: int | None,
+    default_sample_rate: int,
+    target_sample_rate: int = AUDIOCODECS_METRIC_SAMPLE_RATE,
+) -> torch.Tensor:
+    """Resample audio, using a metric's configured rate as the fallback."""
+    source_rate = default_sample_rate if sample_rate is None else sample_rate
+    if source_rate == target_sample_rate:
+        return wavs
+    return torchaudio.functional.resample(wavs, source_rate, target_sample_rate)
+
+
+def _unpadded_audio(
+    wavs: torch.Tensor, length: torch.Tensor | None
+) -> list[torch.Tensor]:
+    """Return individual unpadded waveforms."""
+    if length is None:
+        return list(wavs)
+    return undo_padding(wavs, length)
+
+
+class DNSMOSStats(SingleMetricStats):
+    """Deep Noise Suppression Mean Opinion Score (DNSMOS P.808).
+
+    This is the DNSMOS implementation used by the audiocodecs SLM recipe.
+    The bundled ONNX model is evaluated over 9.01-second windows at 16 kHz.
+
+    Arguments
+    ---------
+    sample_rate : int
+        Default input sample rate.
+    model : object | None
+        An existing ONNX Runtime session.
+    model_path : str | PathLike | None
+        Path to the DNSMOS P.808 ONNX model.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = AUDIOCODECS_METRIC_SAMPLE_RATE,
+        model: object | None = None,
+        model_path: str | PathLike | None = None,
+        run_opts: dict | None = None,
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+        if model is None:
+            model_path = (
+                DNSMOS_DEFAULT_MODEL_PATH
+                if model_path is None
+                else Path(model_path)
+            )
+            if not Path(model_path).is_file():
+                raise FileNotFoundError(
+                    f"DNSMOS model not found at {model_path}. Reinstall speechometer "
+                    "with package data or provide model_path."
+                )
+            session_options = onnxruntime.SessionOptions()
+            session_options.inter_op_num_threads = os.cpu_count()
+            session_options.intra_op_num_threads = os.cpu_count()
+            model = onnxruntime.InferenceSession(
+                str(model_path), sess_options=session_options
+            )
+        self.model = model
+
+    @torch.no_grad()
+    def append(
+        self,
+        ids: list,
+        wavs: torch.Tensor,
+        length: torch.Tensor | None,
+        text: list | None = None,
+        wavs_ref: torch.Tensor | None = None,
+        length_ref: torch.Tensor | None = None,
+        sample_rate: int | None = None,
+        sample_rate_ref: int | None = None,
+        language: str | None = None,
+    ):
+        """Evaluate a batch and append one P.808 MOS score per waveform."""
+        if wavs.ndim != 2:
+            raise ValueError("DNSMOS expects waveforms shaped [batch, time]")
+        wavs = _resample_audio(wavs, sample_rate, self.sample_rate)
+        scores = [
+            {"p808_mos": self._score(wav.cpu().numpy())}
+            for wav in _unpadded_audio(wavs, length)
+        ]
+        self.append_scores(ids, scores)
+
+    def _score(self, audio: np.ndarray) -> float:
+        sample_rate = AUDIOCODECS_METRIC_SAMPLE_RATE
+        required_samples = int(DNSMOS_INPUT_LENGTH * sample_rate)
+        if audio.size == 0:
+            return float("nan")
+        if audio.size < required_samples:
+            repeats = int(np.ceil(required_samples / audio.size))
+            audio = np.tile(audio, repeats)
+
+        num_hops = (
+            int(np.floor(audio.size / sample_rate) - DNSMOS_INPUT_LENGTH) + 1
+        )
+        scores = []
+        for index in range(max(num_hops, 0)):
+            start = index * sample_rate
+            segment = audio[start : start + required_samples]
+            if segment.size < required_samples:
+                continue
+            features = np.asarray(
+                self._audio_melspec(segment[:-160]), dtype=np.float32
+            )[None]
+            scores.append(
+                float(self.model.run(None, {"input_1": features})[0][0][0])
+            )
+        return float(np.mean(scores)) if scores else float("nan")
+
+    @staticmethod
+    def _audio_melspec(audio: np.ndarray) -> np.ndarray:
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio,
+            sr=AUDIOCODECS_METRIC_SAMPLE_RATE,
+            n_fft=321,
+            hop_length=160,
+            n_mels=120,
+        )
+        return ((librosa.power_to_db(mel_spec, ref=np.max) + 40) / 40).T
+
+
+class STOIStats(SingleMetricStats):
+    """Short-time objective intelligibility (STOI)."""
+
+    def __init__(
+        self,
+        sample_rate: int = AUDIOCODECS_METRIC_SAMPLE_RATE,
+        run_opts: dict | None = None,
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+
+    @torch.no_grad()
+    def append(
+        self,
+        ids: list,
+        wavs: torch.Tensor,
+        length: torch.Tensor | None,
+        text: list | None = None,
+        wavs_ref: torch.Tensor | None = None,
+        length_ref: torch.Tensor | None = None,
+        sample_rate: int | None = None,
+        sample_rate_ref: int | None = None,
+        language: str | None = None,
+    ):
+        """Evaluate STOI against reference waveforms."""
+        if wavs_ref is None:
+            raise ValueError("STOI requires wavs_ref")
+        if length_ref is None:
+            length_ref = length
+        wavs = _resample_audio(wavs, sample_rate, self.sample_rate)
+        wavs_ref = _resample_audio(wavs_ref, sample_rate_ref, self.sample_rate)
+        scores = []
+        for hyp, ref in zip(
+            _unpadded_audio(wavs, length),
+            _unpadded_audio(wavs_ref, length_ref),
+        ):
+            size = min(hyp.numel(), ref.numel())
+            score = stoi.short_time_objective_intelligibility(
+                hyp[:size].cpu(),
+                ref[:size].cpu(),
+                AUDIOCODECS_METRIC_SAMPLE_RATE,
+            ).float()
+            scores.append(score)
+        self.append_scores(ids, torch.stack(scores))
+
+
+class PESQStats(SingleMetricStats):
+    """Wide-band perceptual evaluation of speech quality (PESQ)."""
+
+    def __init__(
+        self,
+        sample_rate: int = AUDIOCODECS_METRIC_SAMPLE_RATE,
+        run_opts: dict | None = None,
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+
+    @torch.no_grad()
+    def append(
+        self,
+        ids: list,
+        wavs: torch.Tensor,
+        length: torch.Tensor | None,
+        text: list | None = None,
+        wavs_ref: torch.Tensor | None = None,
+        length_ref: torch.Tensor | None = None,
+        sample_rate: int | None = None,
+        sample_rate_ref: int | None = None,
+        language: str | None = None,
+    ):
+        """Evaluate PESQ against reference waveforms."""
+        if wavs_ref is None:
+            raise ValueError("PESQ requires wavs_ref")
+        if length_ref is None:
+            length_ref = length
+        wavs = _resample_audio(wavs, sample_rate, self.sample_rate)
+        wavs_ref = _resample_audio(wavs_ref, sample_rate_ref, self.sample_rate)
+        scores = []
+        for hyp, ref in zip(
+            _unpadded_audio(wavs, length),
+            _unpadded_audio(wavs_ref, length_ref),
+        ):
+            size = min(hyp.numel(), ref.numel())
+            score = pesq.perceptual_evaluation_speech_quality(
+                hyp[:size], ref[:size], AUDIOCODECS_METRIC_SAMPLE_RATE, "wb"
+            ).cpu()
+            scores.append(score)
+        self.append_scores(ids, torch.stack(scores))
+
+
+class MelDistanceStats(SingleMetricStats):
+    """L2 distance between log-Mel spectrograms."""
+
+    def __init__(
+        self,
+        sample_rate: int = AUDIOCODECS_METRIC_SAMPLE_RATE,
+        n_mels: int = 80,
+        n_fft: int = 1024,
+        hop_length: int = 320,
+        run_opts: dict | None = None,
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=AUDIOCODECS_METRIC_SAMPLE_RATE,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            power=1.0,
+        )
+        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB()
+
+    @torch.no_grad()
+    def append(
+        self,
+        ids: list,
+        wavs: torch.Tensor,
+        length: torch.Tensor | None,
+        text: list | None = None,
+        wavs_ref: torch.Tensor | None = None,
+        length_ref: torch.Tensor | None = None,
+        sample_rate: int | None = None,
+        sample_rate_ref: int | None = None,
+        language: str | None = None,
+    ):
+        """Evaluate Mel distance against reference waveforms."""
+        if wavs_ref is None:
+            raise ValueError("Mel distance requires wavs_ref")
+        if length_ref is None:
+            length_ref = length
+        wavs = _resample_audio(wavs, sample_rate, self.sample_rate)
+        wavs_ref = _resample_audio(wavs_ref, sample_rate_ref, self.sample_rate)
+        self.mel_spec.to(wavs.device)
+        self.amplitude_to_db.to(wavs.device)
+        scores = []
+        for hyp, ref in zip(
+            _unpadded_audio(wavs, length),
+            _unpadded_audio(wavs_ref, length_ref),
+        ):
+            size = min(hyp.numel(), ref.numel())
+            hyp_mel = self.amplitude_to_db(self.mel_spec(hyp[:size]))
+            ref_mel = self.amplitude_to_db(self.mel_spec(ref[:size]))
+            scores.append((hyp_mel - ref_mel).norm(dim=0).mean().cpu())
+        self.append_scores(ids, torch.stack(scores))
+
+
+class STFTDistanceStats(SingleMetricStats):
+    """L2 distance between log-magnitude STFT spectrograms."""
+
+    def __init__(
+        self,
+        sample_rate: int = AUDIOCODECS_METRIC_SAMPLE_RATE,
+        n_fft: int = 1024,
+        hop_length: int = 320,
+        run_opts: dict | None = None,
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB()
+
+    @torch.no_grad()
+    def append(
+        self,
+        ids: list,
+        wavs: torch.Tensor,
+        length: torch.Tensor | None,
+        text: list | None = None,
+        wavs_ref: torch.Tensor | None = None,
+        length_ref: torch.Tensor | None = None,
+        sample_rate: int | None = None,
+        sample_rate_ref: int | None = None,
+        language: str | None = None,
+    ):
+        """Evaluate STFT distance against reference waveforms."""
+        if wavs_ref is None:
+            raise ValueError("STFT distance requires wavs_ref")
+        if length_ref is None:
+            length_ref = length
+        wavs = _resample_audio(wavs, sample_rate, self.sample_rate)
+        wavs_ref = _resample_audio(wavs_ref, sample_rate_ref, self.sample_rate)
+        self.amplitude_to_db.to(wavs.device)
+        window = torch.hann_window(self.n_fft, device=wavs.device)
+        scores = []
+        for hyp, ref in zip(
+            _unpadded_audio(wavs, length),
+            _unpadded_audio(wavs_ref, length_ref),
+        ):
+            size = min(hyp.numel(), ref.numel())
+            hyp_stft = torch.stft(
+                hyp[:size],
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                window=window,
+                return_complex=True,
+            ).abs()
+            ref_stft = torch.stft(
+                ref[:size],
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                window=window,
+                return_complex=True,
+            ).abs()
+            hyp_db = self.amplitude_to_db(hyp_stft)
+            ref_db = self.amplitude_to_db(ref_stft)
+            scores.append((hyp_db - ref_db).norm(dim=0).mean().cpu())
+        self.append_scores(ids, torch.stack(scores))
+
+
+class ASRPerplexityStats(SingleMetricStats):
+    """Perplexity of ASR transcripts under a causal language model.
+
+    The corpus-level ``perplexity`` summary is token-weighted. Descriptive
+    statistics over per-utterance perplexities are included alongside it.
+
+    Arguments
+    ---------
+    model_hub : str
+        Hugging Face causal language model identifier.
+    sample_rate : int
+        Default input sample rate.
+    transcriber : Transcriber | Callable | None
+        ASR transcriber; defaults to the project's Whisper wrapper.
+    asr_model_hub : str
+        Whisper model size or full Hugging Face identifier.
+    model : torch.nn.Module | None
+        Existing causal language model.
+    tokenizer : object | None
+        Existing tokenizer for the causal language model.
+    """
+
+    def __init__(
+        self,
+        model_hub: str = ASR_PERPLEXITY_DEFAULT_MODEL_HUB,
+        sample_rate: int = AUDIOCODECS_METRIC_SAMPLE_RATE,
+        save_path: str | PathLike | None = None,
+        model: torch.nn.Module | None = None,
+        tokenizer: object | None = None,
+        asr_model_hub: str = "small",
+        asr_model: Transcriber | Callable | None = None,
+        transcriber: Transcriber | Callable | None = None,
+        run_opts: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+        cache_dir = None if save_path is None else str(save_path)
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(
+            model_hub, cache_dir=cache_dir
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model = model or AutoModelForCausalLM.from_pretrained(
+            model_hub, cache_dir=cache_dir
+        )
+
+        transcriber = transcriber or asr_model
+        if transcriber is None:
+            source = (
+                asr_model_hub
+                if "/" in asr_model_hub
+                else f"openai/whisper-{asr_model_hub}"
+            )
+            self.transcriber = WhisperTranscriber(
+                source=source,
+                save_path=save_path,
+                sample_rate=AUDIOCODECS_METRIC_SAMPLE_RATE,
+                run_opts=run_opts,
+                **{
+                    key: value
+                    for key, value in kwargs.items()
+                    if key
+                    in {"min_decode_ratio", "max_decode_ratio", "unbatch"}
+                },
+            )
+        elif isinstance(transcriber, Transcriber):
+            self.transcriber = transcriber
+        else:
+            self.transcriber = transcriber(run_opts=run_opts)
+        self.clear()
+
+    def clear(self):
+        """Clear accumulated scores, transcripts, and token counts."""
+        super().clear()
+        self.texts = []
+        self.perplexities = []
+        self.counts = []
+
+    @torch.no_grad()
+    def append(
+        self,
+        ids: list,
+        wavs: torch.Tensor,
+        length: torch.Tensor | None,
+        text: list | None = None,
+        wavs_ref: torch.Tensor | None = None,
+        length_ref: torch.Tensor | None = None,
+        sample_rate: int | None = None,
+        sample_rate_ref: int | None = None,
+        language: str | None = None,
+    ):
+        """Transcribe audio and append per-utterance perplexities."""
+        if length is None:
+            length = torch.ones(len(wavs), device=wavs.device)
+        if sample_rate is None:
+            sample_rate = self.sample_rate
+        texts = self.transcriber.transcribe(
+            wavs=wavs,
+            length=length,
+            sample_rate=sample_rate,
+            language=language,
+        )
+        device = wavs.device
+        self.model.to(device)
+        self.model.eval()
+        tokenized = self.tokenizer(texts, return_tensors="pt", padding=True)
+        input_ids = tokenized["input_ids"].to(device)
+        attention_mask = tokenized["attention_mask"].to(device)
+        logits = self.model(input_ids, attention_mask=attention_mask).logits
+        labels = input_ids[..., 1:].contiguous()
+        mask = attention_mask[..., 1:].contiguous()
+        counts = mask.sum(dim=1)
+        log_perplexities = (
+            torch.nn.functional.cross_entropy(
+                logits[..., :-1, :].movedim(-1, -2),
+                labels,
+                reduction="none",
+            )
+            * mask
+        ).sum(dim=1) / counts.clamp_min(1)
+        valid = (counts > 0) & log_perplexities.isfinite()
+        if not valid.any():
+            return
+
+        valid_items = valid.cpu().tolist()
+        valid_ids = [item for item, keep in zip(ids, valid_items) if keep]
+        valid_texts = [item for item, keep in zip(texts, valid_items) if keep]
+        log_perplexities = log_perplexities[valid]
+        counts = counts[valid]
+        perplexities = log_perplexities.exp().cpu().tolist()
+        self.append_scores(
+            valid_ids,
+            [{"perplexity": value} for value in perplexities],
+        )
+        self.texts.extend(valid_texts)
+        self.perplexities.extend(perplexities)
+        self.counts.extend(counts.cpu().tolist())
+
+    def _summarize(self) -> dict:
+        if not self.scores:
+            return {}
+        summary = descriptive_statistics(self.scores)
+        log_perplexities = torch.tensor(self.perplexities).log()
+        counts = torch.tensor(self.counts)
+        summary["perplexity"] = (
+            ((log_perplexities * counts).sum() / counts.sum()).exp().item()
+        )
+        self.summary = summary
+        return summary
 
 
 class NISQAStats(SingleMetricStats):

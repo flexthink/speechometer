@@ -1466,7 +1466,7 @@ class SpkSimECAPATDNNStats(SingleMetricStats):
         if run_opts is None:
             run_opts = {}
         self.model = SpeakerRecognition.from_hparams(
-            source, savedir=save_path, **run_opts
+            source, savedir=save_path, run_opts=run_opts
         )
         self.clear()
         self.model_sample_rate = model_sample_rate

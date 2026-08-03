@@ -6,7 +6,7 @@ dependencies = [
     "librosa",
     "numpy",
     "onnxruntime",
-    "speechbrain @ git+https://github.com/flexthink/speechbrain.git@paintbrush-fix",
+    "speechbrain @ git+https://github.com/speechbrain/speechbrain.git@develop",
     "torch",
     "torchaudio",
     "torchmetrics[audio]",

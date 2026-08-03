@@ -1507,9 +1507,10 @@ class SpkSimECAPATDNNStats(SingleMetricStats):
         language : str | None
             The language identifier, if applicable
         """
-        assert wavs.shape == wavs_ref.shape
         assert wavs.ndim == 2
         assert wavs_ref is not None
+        assert wavs_ref.ndim == 2
+        assert len(wavs) == len(wavs_ref)
 
         if sample_rate is None:
             sample_rate = self.sample_rate
@@ -1529,18 +1530,17 @@ class SpkSimECAPATDNNStats(SingleMetricStats):
                 self.model_sample_rate
             )
 
-        # Concatenate
-        audio = torch.cat([wavs, wavs_ref])
-        if length is not None:
-            length = torch.cat([length, length])
         assert self.model is not None
         self.model.device = wavs.device
         self.model.to(wavs.device)
         self.model.eval()
 
-        # Forward
-        embs = self.model.encode_batch(audio, length, normalize=False)
-        hyp_embs, ref_embs = embs.split([len(wavs), len(wavs_ref)])
+        # Encode separately because the hypothesis and reference batches may
+        # have different padded time dimensions and relative lengths.
+        hyp_embs = self.model.encode_batch(wavs, length, normalize=False)
+        ref_embs = self.model.encode_batch(
+            wavs_ref, length_ref, normalize=False
+        )
         scores = self.model.similarity(hyp_embs, ref_embs)[:, 0]
         self.append_scores(ids, scores)
 
@@ -1618,12 +1618,10 @@ class SpkSimWavLMStats(SingleMetricStats):
         language : str | None
             The language identifier, if applicable
         """
+        assert wavs_ref is not None
         assert wavs.ndim == 2
         assert wavs_ref.ndim == 2
-        if wavs.size(1) != wavs_ref.size(1):
-            min_length = min(wavs.size(1), wavs_ref.size(1))
-            wavs = wavs[:, :min_length]
-            wavs_ref = wavs_ref[:, :min_length]
+        assert len(wavs) == len(wavs_ref)
 
         if sample_rate is None:
             sample_rate = self.sample_rate
@@ -1643,32 +1641,38 @@ class SpkSimWavLMStats(SingleMetricStats):
                 self.model_sample_rate
             )
 
-        # Concatenate
-        audio = torch.cat([wavs, wavs_ref])
-        if length is not None:
-            length = torch.cat([length, length])
+        self.model.to(wavs.device)
+        self.model.eval()
 
-        # Attention mask
+        # Build masks and encode separately because the hypothesis and
+        # reference batches may have different padded time dimensions.
         attention_mask = None
         if length is not None:
-            abs_length = length * audio.shape[-1]
             attention_mask = length_to_mask(
-                abs_length.int()
+                (length * wavs.shape[-1]).int(),
+                max_len=wavs.shape[-1],
+            ).long()  # 0 for masked tokens
+        attention_mask_ref = None
+        if length_ref is not None:
+            attention_mask_ref = length_to_mask(
+                (length_ref * wavs_ref.shape[-1]).int(),
+                max_len=wavs_ref.shape[-1],
             ).long()  # 0 for masked tokens
 
-        # Forward
-        embs = self.model(
-            input_values=audio,
+        hyp_embs = self.model(
+            input_values=wavs,
             attention_mask=attention_mask,
             output_attentions=False,
         ).embeddings
-
-        hyp_embs, ref_embs = embs.split([len(wavs), len(wavs_ref)])
+        ref_embs = self.model(
+            input_values=wavs_ref,
+            attention_mask=attention_mask_ref,
+            output_attentions=False,
+        ).embeddings
         scores = torch.nn.functional.cosine_similarity(
             hyp_embs, ref_embs, dim=-1
         )
 
-        self.ids += ids
         self.append_scores(ids, scores)
 
 

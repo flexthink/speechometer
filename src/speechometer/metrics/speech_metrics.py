@@ -86,9 +86,22 @@ UTMOS_DEFAULT_JUDGE_ID = 288
 UTMOS_DEFAULT_DOMAIN_ID = 0
 
 AUDIOCODECS_METRIC_SAMPLE_RATE = 16000
+PESQ_MINIMUM_SCORE = -0.5
 DNSMOS_INPUT_LENGTH = 9.01
 DNSMOS_DEFAULT_MODEL_PATH = Path(__file__).with_name("model_v8.onnx")
 ASR_PERPLEXITY_DEFAULT_MODEL_HUB = "meta-llama/Llama-3.2-1B"
+
+
+def _pesq_has_no_utterances(error: Exception) -> bool:
+    """Whether a PESQ backend error means the waveform contains no speech.
+
+    ``cypesq`` normally exposes this as ``NoUtterancesError``. Some versions
+    instead leak a ``ValueError`` while converting the resulting NaN.
+    """
+    return error.__class__.__name__ == "NoUtterancesError" or (
+        isinstance(error, ValueError)
+        and str(error) == "cannot convert float NaN to integer"
+    )
 
 
 class SpeechMetricStats(MetricStats, ABC):
@@ -1049,14 +1062,27 @@ class PESQStats(SingleMetricStats):
         wavs = _resample_audio(wavs, sample_rate, self.sample_rate)
         wavs_ref = _resample_audio(wavs_ref, sample_rate_ref, self.sample_rate)
         scores = []
-        for hyp, ref in zip(
+        for utterance_id, hyp, ref in zip(
+            ids,
             _unpadded_audio(wavs, length),
             _unpadded_audio(wavs_ref, length_ref),
         ):
             size = min(hyp.numel(), ref.numel())
-            score = pesq.perceptual_evaluation_speech_quality(
-                hyp[:size], ref[:size], AUDIOCODECS_METRIC_SAMPLE_RATE, "wb"
-            ).cpu()
+            try:
+                score = pesq.perceptual_evaluation_speech_quality(
+                    hyp[:size], ref[:size], AUDIOCODECS_METRIC_SAMPLE_RATE, "wb"
+                ).cpu()
+            except Exception as error:
+                # cypesq raises this for silent / too-short synthesized audio.
+                # Do not hide other PESQ errors, which may indicate bad inputs.
+                if not _pesq_has_no_utterances(error):
+                    raise
+                logger.warning(
+                    "PESQ found no utterances for %s; using its minimum score (%s).",
+                    utterance_id,
+                    PESQ_MINIMUM_SCORE,
+                )
+                score = torch.tensor(PESQ_MINIMUM_SCORE)
             scores.append(score)
         self.append_scores(ids, torch.stack(scores))
 
